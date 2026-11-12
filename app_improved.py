@@ -56,7 +56,7 @@ st.markdown(
 
 
 # =========================================================
-# 2. الاتصال بقاعدة البيانات (مُحسّن بقوة لمنع خطأ 429)
+# 2. الاتصال بقاعدة البيانات (مُحسّن لمنع خطأ 429)
 # =========================================================
 QUESTIONS_TAB = "Questions"
 RESPONSES_TAB = "Responses"
@@ -72,8 +72,6 @@ REQUIRED_QUESTIONS_COLUMNS = [
     "Options",
 ]
 
-# تخزين أوبجكت الشيتات نفسها في الذاكرة الدائمة (cache_resource) 
-# هذا يمنع أي استدعاء لـ API عند الضغط على الأزرار أو الكتابة
 @st.cache_resource
 def get_worksheets():
     scopes = [
@@ -105,7 +103,7 @@ except Exception as e:
 
 
 # =========================================================
-# 3. تسجيل الدخول والمصادقة (مخزن مؤقتاً لـ 5 دقائق)
+# 3. تسجيل الدخول والمصادقة
 # =========================================================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -155,7 +153,7 @@ if not st.session_state.authenticated:
 
 
 # =========================================================
-# 4. جلب الأسئلة والإجابات السابقة (طلب API واحد فقط)
+# 4. جلب الأسئلة والإجابات السابقة
 # =========================================================
 def parse_yes_no(value):
     return str(value).strip().lower() in {"yes", "y", "true", "1", "نعم"}
@@ -225,7 +223,43 @@ existing_response, existing_row_idx = get_existing_response(st.session_state.use
 
 
 # =========================================================
-# 5. دوال الحفظ وتحديث الخيارات الجديدة
+# 5. تهيئة الحالة لضمان عدم ضياع الإجابات (Session State Initialization)
+# =========================================================
+if "initialized_answers" not in st.session_state:
+    st.session_state.initialized_answers = True
+    for q in questions:
+        qid = q["id"]
+        answer_key = f"Q{qid}: {q['question']}"
+        old_val = existing_response.get(answer_key, "") if existing_response else ""
+        
+        if q["type"] == "single":
+            custom_label = "➕ إضافة خيار آخر"
+            if old_val in q["options"]:
+                st.session_state[f"q_{qid}"] = old_val
+            elif old_val and q["allow_new"]:
+                st.session_state[f"q_{qid}"] = custom_label
+                st.session_state[f"custom_single_{qid}"] = old_val
+            else:
+                st.session_state[f"q_{qid}"] = "— اختر —"
+        elif q["type"] == "multiple":
+            def_multi = [v.strip() for v in old_val.split("|") if v.strip()] if old_val else []
+            std_options = q["options"]
+            custom_saved = [v for v in def_multi if v not in std_options]
+            st.session_state[f"q_{qid}"] = [v for v in def_multi if v in std_options]
+            if q["allow_new"]:
+                st.session_state[f"custom_multi_{qid}"] = ", ".join(custom_saved)
+
+for ax in axes:
+    if f"axis_toggle_{ax}" not in st.session_state:
+        axis_status_key = f"[حالة القسم] {ax}"
+        default_val = True
+        if existing_response and existing_response.get(axis_status_key) == "لا ينطبق":
+            default_val = False
+        st.session_state[f"axis_toggle_{ax}"] = default_val
+
+
+# =========================================================
+# 6. دوال الحفظ وتحديث الخيارات
 # =========================================================
 def update_new_options(new_options_dict):
     if not new_options_dict:
@@ -262,7 +296,7 @@ def save_or_update_response(answer_data, row_idx=None):
 
 
 # =========================================================
-# 6. واجهة الاستبيان
+# 7. واجهة الاستبيان
 # =========================================================
 st.title("📋 نموذج تقييم المخاطر")
 
@@ -280,11 +314,61 @@ if "saved_axes" not in st.session_state:
 if "axis_pages" not in st.session_state:
     st.session_state.axis_pages = {ax: 0 for ax in axes}
 
+# --- تجميع الإجابات والتحقق منها من الـ session_state مباشرة لضمان عدم ضياع أي شيء ---
 answers = {}
 axis_errors = {}
 new_options = {}
 
-# --- الشريط الجانبي ---
+for axis_name in axes:
+    axis_errors[axis_name] = []
+    applicable = st.session_state.get(f"axis_toggle_{axis_name}", True)
+    answers[f"[حالة القسم] {axis_name}"] = "ينطبق" if applicable else "لا ينطبق"
+
+    axis_questions = [q for q in questions if q["axis"] == axis_name]
+    if not applicable:
+        for q in axis_questions:
+            answers[f"Q{q['id']}: {q['question']}"] = "لا ينطبق"
+    else:
+        for q in axis_questions:
+            qid = q["id"]
+            answer_key = f"Q{qid}: {q['question']}"
+            
+            if q["type"] == "single":
+                sel = st.session_state.get(f"q_{qid}", "— اختر —")
+                if sel == "➕ إضافة خيار آخر" and q["allow_new"]:
+                    custom_val = st.session_state.get(f"custom_single_{qid}", "").strip()
+                    answers[answer_key] = custom_val
+                    if not custom_val:
+                        axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
+                    else:
+                        new_options[qid] = custom_val
+                elif sel == "— اختر —":
+                    answers[answer_key] = ""
+                    axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
+                else:
+                    answers[answer_key] = sel
+
+            elif q["type"] == "multiple":
+                selected_opts = st.session_state.get(f"q_{qid}", [])
+                final_vals = list(selected_opts)
+                if q["allow_new"]:
+                    custom_input = st.session_state.get(f"custom_multi_{qid}", "").strip()
+                    if custom_input:
+                        for item in custom_input.split(","):
+                            ic = item.strip()
+                            if ic:
+                                if ic not in final_vals:
+                                    final_vals.append(ic)
+                                if ic.casefold() not in {opt.casefold() for opt in q["options"]}:
+                                    new_options[qid] = ic
+                answers[answer_key] = " | ".join(final_vals)
+                if not final_vals:
+                    axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
+
+all_validation_errors = [e for errs in axis_errors.values() for e in errs]
+
+
+# --- الشريط الجانبي للإدارة والاعتماد ---
 with st.sidebar:
     st.subheader(f"🏢 {st.session_state.entity_name}")
     st.write("---")
@@ -296,9 +380,11 @@ with st.sidebar:
     if not st.session_state.questionnaire_submitted:
         btn_label = "✅ تحديث الإجابات" if existing_response else "✅ الاعتماد والإرسال النهائي"
         if st.button(btn_label, type="primary", use_container_width=True):
-            all_errs = [e for errs in axis_errors.values() for e in errs]
-            if all_errs:
-                st.error("يوجد أسئلة غير مجابة في بعض الأقسام.")
+            if all_validation_errors:
+                st.error("يوجد أسئلة غير مجابة في الأقسام:")
+                for ax, errs in axis_errors.items():
+                    if errs:
+                        st.write(f"**{ax}**: {len(errs)} أسئلة")
             else:
                 try:
                     timestamp = datetime.now(DUBAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -313,7 +399,6 @@ with st.sidebar:
                     save_or_update_response(resp_data, row_idx=existing_row_idx)
                     update_new_options(new_options)
                     
-                    # مسح الـ Cache الخاص بالإجابات لضمان ظهور التحديثات
                     get_existing_response.clear()
                     load_questions.clear()
                     
@@ -330,23 +415,22 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-# --- محتوى الأسئلة ---
+
+# --- عرض الأقسام والأسئلة ---
 tab_labels = [f"{'✅' if ax in st.session_state.saved_axes else '⏳'} {ax}" for ax in axes]
 tabs = st.tabs(tab_labels)
 QUESTIONS_PER_PAGE = 5
 
 for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
     axis_questions = [q for q in questions if q["axis"] == axis_name]
-    axis_errors[axis_name] = []
 
     with tab:
         with st.container():
             col_h, col_save = st.columns([3, 1])
             with col_h:
-                applicable = st.toggle(
+                st.toggle(
                     f"ينطبق هذا القسم على جهتي",
-                    value=True if not existing_response or existing_response.get(f"[حالة القسم] {axis_name}") != "لا ينطبق" else False,
-                    key=f"axis_{axis_index}",
+                    key=f"axis_toggle_{axis_name}",
                     disabled=st.session_state.questionnaire_submitted,
                 )
             with col_save:
@@ -356,12 +440,10 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                         st.success("تم الحفظ محلياً!")
                         st.rerun()
 
-            answers[f"[حالة القسم] {axis_name}"] = "ينطبق" if applicable else "لا ينطبق"
+            applicable = st.session_state.get(f"axis_toggle_{axis_name}", True)
 
             if not applicable:
                 st.caption("تم استبعاد هذا القسم من التقييم.")
-                for q in axis_questions:
-                    answers[f"Q{q['id']}: {q['question']}"] = "لا ينطبق"
             else:
                 total_q = len(axis_questions)
                 total_pages = (total_q + QUESTIONS_PER_PAGE - 1) // QUESTIONS_PER_PAGE
@@ -375,10 +457,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 
                 for q in page_questions:
                     qid = q["id"]
-                    answer_key = f"Q{qid}: {q['question']}"
                     st.markdown(f"**{qid}. {q['question']}**")
-
-                    old_val = existing_response.get(answer_key, "") if existing_response else ""
 
                     if q["type"] == "single":
                         custom_label = "➕ إضافة خيار آخر"
@@ -386,74 +465,41 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                         if q["allow_new"]:
                             display_options.append(custom_label)
 
-                        def_idx = 0
-                        is_custom_old = False
-                        if old_val in q["options"]:
-                            def_idx = display_options.index(old_val)
-                        elif old_val and q["allow_new"] and old_val != "لا ينطبق":
-                            is_custom_old = True
-                            def_idx = display_options.index(custom_label)
-
-                        selected = st.radio(
+                        st.radio(
                             "اختر:",
                             options=display_options,
-                            index=def_idx,
                             key=f"q_{qid}",
                             horizontal=True,
                             label_visibility="collapsed",
                             disabled=st.session_state.questionnaire_submitted,
                         )
 
-                        if selected == custom_label and q["allow_new"]:
-                            custom_value = st.text_input("اكتب الخيار:", value=old_val if is_custom_old else "", key=f"custom_single_{qid}", label_visibility="collapsed").strip()
-                            answers[answer_key] = custom_value
-                            if not custom_value:
-                                axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
-                            else:
-                                new_options[qid] = custom_value
-                        elif selected == "— اختر —":
-                            answers[answer_key] = ""
-                            axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
-                        else:
-                            answers[answer_key] = selected
+                        # إظهار حقل كتابة الخيار الآخر إذا تم اختياره
+                        current_sel = st.session_state.get(f"q_{qid}")
+                        if current_sel == custom_label and q["allow_new"]:
+                            st.text_input(
+                                "اكتب الخيار:",
+                                key=f"custom_single_{qid}",
+                                label_visibility="collapsed",
+                                disabled=st.session_state.questionnaire_submitted,
+                            )
 
                     elif q["type"] == "multiple":
-                        def_multi = [v.strip() for v in old_val.split("|") if v.strip() and v != "لا ينطبق"] if old_val else []
-                        std_options = q["options"]
-                        custom_saved = [v for v in def_multi if v not in std_options]
-
-                        selected_values = st.multiselect(
+                        st.multiselect(
                             "اختر:",
-                            options=std_options,
-                            default=[v for v in def_multi if v in std_options],
+                            options=q["options"],
                             key=f"q_{qid}",
                             label_visibility="collapsed",
                             disabled=st.session_state.questionnaire_submitted,
                         )
 
-                        final_values = list(selected_values)
-
                         if q["allow_new"]:
-                            custom_input = st.text_input(
+                            st.text_input(
                                 "أضف خياراً آخر (افصل بين الخيارات بفاصلة):",
-                                value=", ".join(custom_saved),
                                 key=f"custom_multi_{qid}",
                                 label_visibility="collapsed",
                                 disabled=st.session_state.questionnaire_submitted,
-                            ).strip()
-
-                            if custom_input:
-                                for item in custom_input.split(","):
-                                    item_clean = item.strip()
-                                    if item_clean:
-                                        if item_clean not in final_values:
-                                            final_values.append(item_clean)
-                                        if item_clean.casefold() not in {opt.casefold() for opt in std_options}:
-                                            new_options[qid] = item_clean
-
-                        answers[answer_key] = " | ".join(final_values)
-                        if not final_values:
-                            axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
+                            )
 
                     st.markdown("---")
 
