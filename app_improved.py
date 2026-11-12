@@ -38,7 +38,6 @@ st.markdown(
         direction: rtl;
         justify-content: flex-start;
     }
-    /* تقليل الفراغات والهوامش الرأسية لربح المساحة */
     div.stBlock, div.stTabs, div[data-testid="stVerticalBlock"] {
         gap: 0.5rem;
     }
@@ -274,7 +273,7 @@ answers = {}
 axis_errors = {}
 new_options = {}
 
-# --- الشريط الجانبي للإدارة والاعتماد (بدل النزول للأسفل) ---
+# --- الشريط الجانبي للإدارة والاعتماد ---
 with st.sidebar:
     st.subheader(f"🏢 {st.session_state.entity_name}")
     st.write("---")
@@ -315,10 +314,10 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-# --- محتوى الأقسام والأسئلة ---
+# --- محتوى الأقسام والأسئلة (بدون كلمة محور) ---
 tab_labels = [f"{'✅' if ax in st.session_state.saved_axes else '⏳'} {ax}" for ax in axes]
 tabs = st.tabs(tab_labels)
-QUESTIONS_PER_PAGE = 5  # عدد الأسئلة في الصفحة الواحدة ضمن القسم
+QUESTIONS_PER_PAGE = 5
 
 for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
     axis_questions = [q for q in questions if q["axis"] == axis_name]
@@ -368,6 +367,8 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                     if q["type"] == "single":
                         custom_label = "➕ إضافة خيار آخر"
                         display_options = ["— اختر —"] + q["options"]
+                        
+                        # إظهار الخيار الإضافي فقط إذا كان Allow_New مفعل في قوقل شيت
                         if q["allow_new"]:
                             display_options.append(custom_label)
 
@@ -378,18 +379,17 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                             display_options.insert(-1, old_val)
                             def_idx = display_options.index(old_val)
 
-                        # خيارات في نفس الخط (أفقية لربح المساحة)
                         selected = st.radio(
                             "اختر:",
                             options=display_options,
                             index=def_idx,
                             key=f"q_{qid}",
-                            horizontal=True,  # الخيارات بجانب بعضها لربح المساحة الرأسية
+                            horizontal=True,
                             label_visibility="collapsed",
                             disabled=st.session_state.questionnaire_submitted,
                         )
 
-                        if selected == custom_label:
+                        if selected == custom_label and q["allow_new"]:
                             custom_value = st.text_input("اكتب الخيار:", value=old_val if old_val not in q["options"] and old_val else "", key=f"custom_{qid}", label_visibility="collapsed").strip()
                             answers[answer_key] = custom_value
                             if not custom_value:
@@ -398,7 +398,6 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                             answers[answer_key] = ""
                             axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
                         else:
-                        
                             answers[answer_key] = selected
 
                     elif q["type"] == "multiple":
@@ -417,7 +416,6 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 
                     st.markdown("---")
 
-                # أزرار التنقل المصغرة
                 col_p, col_n = st.columns(2)
                 with col_p:
                     if current_page > 0 and st.button("⬅️ السابق", key=f"prev_{axis_name}"):
