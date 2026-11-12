@@ -216,8 +216,8 @@ existing_response, existing_row_idx = get_existing_response(st.session_state.use
 # =========================================================
 # 5. Helpers for saving / updating
 # =========================================================
-def update_new_options(new_options):
-    if not new_options:
+def update_new_options(new_options_dict):
+    if not new_options_dict:
         return
     sheet_headers = questions_ws.row_values(1)
     options_col = sheet_headers.index("Options") + 1
@@ -225,10 +225,10 @@ def update_new_options(new_options):
     updates = []
     for sheet_row, record in enumerate(all_records, start=2):
         qid = int(record["ID"])
-        if qid not in new_options:
+        if qid not in new_options_dict:
             continue
         old_opts = parse_options(record.get("Options", ""))
-        new_opt = new_options[qid].strip()
+        new_opt = new_options_dict[qid].strip()
         if new_opt and new_opt.casefold() not in {i.casefold() for i in old_opts}:
             updated = old_opts + [new_opt]
             updates.append({"range": rowcol_to_a1(sheet_row, options_col), "values": [[" | ".join(updated)]]})
@@ -314,7 +314,7 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-# --- محتوى الأقسام والأسئلة (بدون كلمة محور) ---
+# --- محتوى الأقسام والأسئلة ---
 tab_labels = [f"{'✅' if ax in st.session_state.saved_axes else '⏳'} {ax}" for ax in axes]
 tabs = st.tabs(tab_labels)
 QUESTIONS_PER_PAGE = 5
@@ -364,20 +364,20 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 
                     old_val = existing_response.get(answer_key, "") if existing_response else ""
 
+                    # نوع السؤال: اختيار مفرد (Single)
                     if q["type"] == "single":
                         custom_label = "➕ إضافة خيار آخر"
                         display_options = ["— اختر —"] + q["options"]
-                        
-                        # إظهار الخيار الإضافي فقط إذا كان Allow_New مفعل في قوقل شيت
                         if q["allow_new"]:
                             display_options.append(custom_label)
 
                         def_idx = 0
+                        is_custom_old = False
                         if old_val in q["options"]:
                             def_idx = display_options.index(old_val)
                         elif old_val and q["allow_new"]:
-                            display_options.insert(-1, old_val)
-                            def_idx = display_options.index(old_val)
+                            is_custom_old = True
+                            def_idx = display_options.index(custom_label)
 
                         selected = st.radio(
                             "اختر:",
@@ -390,28 +390,56 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                         )
 
                         if selected == custom_label and q["allow_new"]:
-                            custom_value = st.text_input("اكتب الخيار:", value=old_val if old_val not in q["options"] and old_val else "", key=f"custom_{qid}", label_visibility="collapsed").strip()
+                            custom_value = st.text_input("اكتب الخيار:", value=old_val if is_custom_old else "", key=f"custom_single_{qid}", label_visibility="collapsed").strip()
                             answers[answer_key] = custom_value
                             if not custom_value:
                                 axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
+                            else:
+                                new_options[qid] = custom_value
                         elif selected == "— اختر —":
                             answers[answer_key] = ""
                             axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
                         else:
                             answers[answer_key] = selected
 
+                    # نوع السؤال: اختيار متعدد (Multiple)
                     elif q["type"] == "multiple":
                         def_multi = [v.strip() for v in old_val.split("|") if v.strip()] if old_val else []
+                        std_options = q["options"]
+                        custom_saved = [v for v in def_multi if v not in std_options]
+
                         selected_values = st.multiselect(
                             "اختر:",
-                            options=q["options"],
-                            default=[v for v in def_multi if v in q["options"]],
+                            options=std_options,
+                            default=[v for v in def_multi if v in std_options],
                             key=f"q_{qid}",
                             label_visibility="collapsed",
                             disabled=st.session_state.questionnaire_submitted,
                         )
-                        answers[answer_key] = " | ".join(selected_values)
-                        if not selected_values:
+
+                        final_values = list(selected_values)
+
+                        # إذا كان مسموحاً بإضافة خيار جديد في الأسئلة المتعددة
+                        if q["allow_new"]:
+                            custom_input = st.text_input(
+                                "أضف خياراً آخر (إن وجد):",
+                                value=", ".join(custom_saved),
+                                key=f"custom_multi_{qid}",
+                                label_visibility="collapsed",
+                                disabled=st.session_state.questionnaire_submitted,
+                            ).strip()
+
+                            if custom_input:
+                                for item in custom_input.split(","):
+                                    item_clean = item.strip()
+                                    if item_clean:
+                                        if item_clean not in final_values:
+                                            final_values.append(item_clean)
+                                        if item_clean.casefold() not in {opt.casefold() for opt in std_options}:
+                                            new_options[qid] = item_clean
+
+                        answers[answer_key] = " | ".join(final_values)
+                        if not final_values:
                             axis_errors[axis_name].append(f"السؤال {qid} ناقص.")
 
                     st.markdown("---")
