@@ -9,7 +9,7 @@ from gspread.utils import rowcol_to_a1
 
 
 # =========================================================
-# 1. Page configuration & Custom CSS for compact spacing
+# 1. إعدادات الصفحة والتصميم
 # =========================================================
 st.set_page_config(
     page_title="نموذج تقييم المخاطر",
@@ -56,7 +56,7 @@ st.markdown(
 
 
 # =========================================================
-# 2. Configuration and Google Sheets connection
+# 2. الاتصال بقاعدة البيانات (مُحسّن بقوة لمنع خطأ 429)
 # =========================================================
 QUESTIONS_TAB = "Questions"
 RESPONSES_TAB = "Responses"
@@ -72,9 +72,10 @@ REQUIRED_QUESTIONS_COLUMNS = [
     "Options",
 ]
 
-
+# تخزين أوبجكت الشيتات نفسها في الذاكرة الدائمة (cache_resource) 
+# هذا يمنع أي استدعاء لـ API عند الضغط على الأزرار أو الكتابة
 @st.cache_resource
-def get_spreadsheet():
+def get_worksheets():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -85,21 +86,26 @@ def get_spreadsheet():
     )
     client = gspread.authorize(credentials)
     spreadsheet_id = st.secrets["google_sheets"]["spreadsheet_id"]
-    return client.open_by_key(spreadsheet_id)
-
+    sh = client.open_by_key(spreadsheet_id)
+    
+    return {
+        "questions": sh.worksheet(QUESTIONS_TAB),
+        "responses": sh.worksheet(RESPONSES_TAB),
+        "users": sh.worksheet(USERS_TAB)
+    }
 
 try:
-    spreadsheet = get_spreadsheet()
-    questions_ws = spreadsheet.worksheet(QUESTIONS_TAB)
-    responses_ws = spreadsheet.worksheet(RESPONSES_TAB)
-    users_ws = spreadsheet.worksheet(USERS_TAB)
+    sheets = get_worksheets()
+    questions_ws = sheets["questions"]
+    responses_ws = sheets["responses"]
+    users_ws = sheets["users"]
 except Exception as e:
     st.error(f"خطأ في الاتصال بقاعدة البيانات: {e}")
     st.stop()
 
 
 # =========================================================
-# 3. Authentication & Settings (Cached to prevent 429 errors)
+# 3. تسجيل الدخول والمصادقة (مخزن مؤقتاً لـ 5 دقائق)
 # =========================================================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -149,7 +155,7 @@ if not st.session_state.authenticated:
 
 
 # =========================================================
-# 4. Load questionnaire & Existing Response
+# 4. جلب الأسئلة والإجابات السابقة (طلب API واحد فقط)
 # =========================================================
 def parse_yes_no(value):
     return str(value).strip().lower() in {"yes", "y", "true", "1", "نعم"}
@@ -163,17 +169,18 @@ def parse_options(value):
 @st.cache_data(ttl=300)
 def load_questions():
     records = questions_ws.get_all_records()
-    headers = questions_ws.row_values(1)
+    if not records:
+        return []
+    
+    headers = list(records[0].keys())
     missing = [c for c in REQUIRED_QUESTIONS_COLUMNS if c not in headers]
     if missing:
         raise ValueError(f"أعمدة مفقودة في الأسئلة: {', '.join(missing)}")
 
-    questions = []
-    seen_ids = set()
+    questions_list = []
     for sheet_row, record in enumerate(records, start=2):
         qid = int(record["ID"])
-        seen_ids.add(qid)
-        questions.append({
+        questions_list.append({
             "id": qid,
             "axis": str(record["Axis"]).strip(),
             "question": str(record["Question"]).strip(),
@@ -182,7 +189,7 @@ def load_questions():
             "options": parse_options(record.get("Options", "")),
             "sheet_row": sheet_row,
         })
-    return questions
+    return questions_list
 
 
 try:
@@ -198,10 +205,14 @@ axes = list(dict.fromkeys(q["axis"] for q in questions))
 def get_existing_response(user_code):
     try:
         data = responses_ws.get_all_records()
-        headers = responses_ws.row_values(1)
+        if not data:
+            return None, None
+            
+        headers = list(data[0].keys())
         user_code_col = "User Code" if "User Code" in headers else None
         if not user_code_col:
             return None, None
+            
         for idx, row in enumerate(data, start=2):
             if str(row.get(user_code_col, "")).strip() == str(user_code).strip():
                 return row, idx
@@ -214,7 +225,7 @@ existing_response, existing_row_idx = get_existing_response(st.session_state.use
 
 
 # =========================================================
-# 5. Helpers for saving / updating
+# 5. دوال الحفظ وتحديث الخيارات الجديدة
 # =========================================================
 def update_new_options(new_options_dict):
     if not new_options_dict:
@@ -251,7 +262,7 @@ def save_or_update_response(answer_data, row_idx=None):
 
 
 # =========================================================
-# 6. Questionnaire interface (Sidebar Actions + Clean Tabs)
+# 6. واجهة الاستبيان
 # =========================================================
 st.title("📋 نموذج تقييم المخاطر")
 
@@ -273,7 +284,7 @@ answers = {}
 axis_errors = {}
 new_options = {}
 
-# --- الشريط الجانبي للإدارة والاعتماد ---
+# --- الشريط الجانبي ---
 with st.sidebar:
     st.subheader(f"🏢 {st.session_state.entity_name}")
     st.write("---")
@@ -287,7 +298,7 @@ with st.sidebar:
         if st.button(btn_label, type="primary", use_container_width=True):
             all_errs = [e for errs in axis_errors.values() for e in errs]
             if all_errs:
-                st.error("يوجد أسئلة غير مبيّنة في الأقسام.")
+                st.error("يوجد أسئلة غير مجابة في بعض الأقسام.")
             else:
                 try:
                     timestamp = datetime.now(DUBAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -298,9 +309,14 @@ with st.sidebar:
                         "Timestamp (UAE)": timestamp,
                     }
                     resp_data.update(answers)
+                    
                     save_or_update_response(resp_data, row_idx=existing_row_idx)
                     update_new_options(new_options)
-                    st.cache_data.clear()
+                    
+                    # مسح الـ Cache الخاص بالإجابات لضمان ظهور التحديثات
+                    get_existing_response.clear()
+                    load_questions.clear()
+                    
                     st.session_state.questionnaire_submitted = True
                     st.success("تم الإرسال بنجاح!")
                     st.rerun()
@@ -314,7 +330,7 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-# --- محتوى الأقسام والأسئلة (تسميات الأقسام مباشرة بدون كلمة محور) ---
+# --- محتوى الأسئلة ---
 tab_labels = [f"{'✅' if ax in st.session_state.saved_axes else '⏳'} {ax}" for ax in axes]
 tabs = st.tabs(tab_labels)
 QUESTIONS_PER_PAGE = 5
@@ -329,7 +345,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
             with col_h:
                 applicable = st.toggle(
                     f"ينطبق هذا القسم على جهتي",
-                    value=True if not existing_response or existing_response.get(f"[حالة المحور] {axis_name}") != "لا ينطبق" else False,
+                    value=True if not existing_response or existing_response.get(f"[حالة القسم] {axis_name}") != "لا ينطبق" else False,
                     key=f"axis_{axis_index}",
                     disabled=st.session_state.questionnaire_submitted,
                 )
@@ -337,13 +353,13 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                 if not st.session_state.questionnaire_submitted:
                     if st.button(f"💾 حفظ القسم", key=f"save_btn_{axis_index}", use_container_width=True):
                         st.session_state.saved_axes.add(axis_name)
-                        st.success("حفظ!")
+                        st.success("تم الحفظ محلياً!")
                         st.rerun()
 
-            answers[f"[حالة المحور] {axis_name}"] = "ينطبق" if applicable else "لا ينطبق"
+            answers[f"[حالة القسم] {axis_name}"] = "ينطبق" if applicable else "لا ينطبق"
 
             if not applicable:
-                st.caption("تم استبعاد هذا القسم.")
+                st.caption("تم استبعاد هذا القسم من التقييم.")
                 for q in axis_questions:
                     answers[f"Q{q['id']}: {q['question']}"] = "لا ينطبق"
             else:
@@ -364,7 +380,6 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 
                     old_val = existing_response.get(answer_key, "") if existing_response else ""
 
-                    # 1. نوع السؤال: اختيار مفرد (Single)
                     if q["type"] == "single":
                         custom_label = "➕ إضافة خيار آخر"
                         display_options = ["— اختر —"] + q["options"]
@@ -375,7 +390,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                         is_custom_old = False
                         if old_val in q["options"]:
                             def_idx = display_options.index(old_val)
-                        elif old_val and q["allow_new"]:
+                        elif old_val and q["allow_new"] and old_val != "لا ينطبق":
                             is_custom_old = True
                             def_idx = display_options.index(custom_label)
 
@@ -402,9 +417,8 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                         else:
                             answers[answer_key] = selected
 
-                    # 2. نوع السؤال: اختيار متعدد (Multiple)
                     elif q["type"] == "multiple":
-                        def_multi = [v.strip() for v in old_val.split("|") if v.strip()] if old_val else []
+                        def_multi = [v.strip() for v in old_val.split("|") if v.strip() and v != "لا ينطبق"] if old_val else []
                         std_options = q["options"]
                         custom_saved = [v for v in def_multi if v not in std_options]
 
@@ -421,7 +435,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 
                         if q["allow_new"]:
                             custom_input = st.text_input(
-                                "أضف خياراً آخر (إن وجد):",
+                                "أضف خياراً آخر (افصل بين الخيارات بفاصلة):",
                                 value=", ".join(custom_saved),
                                 key=f"custom_multi_{qid}",
                                 label_visibility="collapsed",
