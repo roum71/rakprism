@@ -16,7 +16,7 @@ from gspread.utils import rowcol_to_a1
 st.set_page_config(
     page_title="نموذج تقييم المخاطر",
     page_icon="📋",
-    layout="centered",
+    layout="wide",
 )
 
 st.markdown(
@@ -61,7 +61,6 @@ QUESTIONS_TAB = "Questions"
 RESPONSES_TAB = "Responses"
 USERS_TAB = "Users"
 DRAFTS_TAB = "Drafts"
-DRAFT_HISTORY_TAB = "Draft History"
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
 
 REQUIRED_QUESTIONS_COLUMNS = [
@@ -118,34 +117,11 @@ def get_worksheets():
             value_input_option="RAW",
         )
 
-    # سجل نسخ احتياطية متتابعة، حتى يمكن استرجاع نسخة أقدم إذا استُبدلت
-    # المسودة الحالية بإجابات فارغة أو غير مكتملة عن طريق الخطأ.
-    try:
-        draft_history_ws = sh.worksheet(DRAFT_HISTORY_TAB)
-    except gspread.WorksheetNotFound:
-        draft_history_ws = sh.add_worksheet(
-            title=DRAFT_HISTORY_TAB,
-            rows=3000,
-            cols=max(10, len(DRAFT_HEADERS)),
-        )
-        draft_history_ws.update(
-            range_name="A1",
-            values=[DRAFT_HEADERS],
-            value_input_option="RAW",
-        )
-    if not draft_history_ws.row_values(1):
-        draft_history_ws.update(
-            range_name="A1",
-            values=[DRAFT_HEADERS],
-            value_input_option="RAW",
-        )
-
     return {
         "questions": questions_ws,
         "responses": responses_ws,
         "users": users_ws,
         "drafts": drafts_ws,
-        "draft_history": draft_history_ws,
     }
 
 
@@ -155,7 +131,6 @@ try:
     responses_ws = sheets["responses"]
     users_ws = sheets["users"]
     drafts_ws = sheets["drafts"]
-    draft_history_ws = sheets["draft_history"]
 except Exception as e:
     st.error(f"خطأ في الاتصال بقاعدة البيانات: {e}")
     st.stop()
@@ -300,39 +275,34 @@ def get_existing_response(user_code):
 
 
 def get_existing_draft(user_code):
-    """إرجاع أحدث نسخة محفوظة من المسودة الحالية أو سجل النسخ الاحتياطية."""
+    """تحميل أحدث مسودة فعلية للجهة من صف Drafts واحد."""
+    matches = []
+    worksheets_to_check = [drafts_ws]
+    # قراءة سجل النسخ القديم إن كان موجوداً، لتسهيل استعادة ما حفظته النسخ السابقة.
     try:
-        matches = []
-        for worksheet in (drafts_ws, draft_history_ws):
-            records = worksheet.get_all_records()
-            for idx, row in enumerate(records, start=2):
-                if str(row.get("User Code", "")).strip() == str(user_code).strip():
-                    updated_at = str(row.get("Updated At (UAE)", "")).strip()
-                    raw_json = row.get("Draft JSON", "")
-                    if raw_json:
-                        try:
-                            payload = json.loads(raw_json)
-                        except (TypeError, json.JSONDecodeError):
-                            continue
-                        answer_values = payload.get("answers", {}) or {}
-                        answered_count = sum(
-                            1 for key, value in answer_values.items()
-                            if str(key).startswith("Q") and str(value).strip()
-                        )
-                        matches.append((answered_count, updated_at, idx, payload))
+        legacy_history = drafts_ws.spreadsheet.worksheet("Draft History")
+        worksheets_to_check.append(legacy_history)
+    except gspread.WorksheetNotFound:
+        pass
 
-        if not matches:
-            return None, None, None
-
-        # عند وجود نسخ متعددة، نقترح النسخة الأكثر احتفاظاً بالإجابات؛
-        # وعند تساوي عدد الإجابات نختار الأحدث زمنياً.
-        answered_count, updated_at, row_idx, payload = max(
-            matches, key=lambda item: (item[0], item[1], item[2])
-        )
-        return payload, row_idx, updated_at
-    except Exception as exc:
-        st.warning(f"تعذر تحميل المسودة السابقة: {exc}")
-    return None, None, None
+    for worksheet in worksheets_to_check:
+        records = worksheet.get_all_records()
+        for idx, row in enumerate(records, start=2):
+            if str(row.get("User Code", "")).strip() != str(user_code).strip():
+                continue
+            raw_json = row.get("Draft JSON", "")
+            if not raw_json:
+                continue
+            try:
+                payload = json.loads(raw_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            timestamp = str(row.get("Updated At (UAE)", "")).strip()
+            matches.append((timestamp, idx, payload))
+    if not matches:
+        return None, None, None
+    timestamp, row_idx, payload = max(matches, key=lambda item: (item[0], item[1]))
+    return payload, row_idx, timestamp
 
 
 try:
@@ -346,9 +316,12 @@ axes = list(dict.fromkeys(q["axis"] for q in questions))
 existing_response, existing_row_idx = get_existing_response(
     st.session_state.user_code
 )
-existing_draft, existing_draft_row_idx, existing_draft_updated_at = get_existing_draft(
-    st.session_state.user_code
-)
+if "initialized_answers" not in st.session_state:
+    existing_draft, existing_draft_row_idx, existing_draft_updated_at = get_existing_draft(
+        st.session_state.user_code
+    )
+else:
+    existing_draft, existing_draft_row_idx, existing_draft_updated_at = None, None, None
 
 # إذا وجدت مسودة، تكون هي المصدر الأحدث. وإلا تُحمّل آخر إجابة معتمدة.
 if existing_draft is not None:
@@ -373,7 +346,7 @@ if "initialized_answers" not in st.session_state:
     for q in questions:
         qid = q["id"]
         answer_key = f"Q{qid}: {q['question']}"
-        old_val = str(saved_answers.get(answer_key, "") or "")
+        old_val = str((existing_draft.get("answers_by_id", {}).get(str(qid)) if existing_draft else None) or saved_answers.get(answer_key, "") or "")
 
         if q["type"] == "single":
             custom_label = "➕ إضافة خيار آخر"
@@ -397,6 +370,8 @@ if "initialized_answers" not in st.session_state:
             ]
             if q["allow_new"]:
                 st.session_state[f"custom_multi_{qid}"] = ", ".join(custom_saved)
+        else:
+            st.session_state[f"q_{qid}"] = old_val
 
 for axis_name in axes:
     toggle_key = f"axis_toggle_{axis_name}"
@@ -406,12 +381,6 @@ for axis_name in axes:
             saved_answers.get(f"[حالة القسم] {axis_name}", "ينطبق"),
         )
         st.session_state[toggle_key] = old_status != "لا ينطبق"
-
-if "axis_pages" not in st.session_state:
-    st.session_state.axis_pages = {ax: 0 for ax in axes}
-else:
-    for ax in axes:
-        st.session_state.axis_pages.setdefault(ax, 0)
 
 if "submission_id" not in st.session_state:
     st.session_state.submission_id = (
@@ -425,7 +394,9 @@ if "active_axis" not in st.session_state:
     st.session_state.active_axis = axes[0] if axes else ""
 
 if "draft_saved_at" not in st.session_state:
-    st.session_state.draft_saved_at = ""
+    st.session_state.draft_saved_at = existing_draft_updated_at or ""
+if "autosave_error" not in st.session_state:
+    st.session_state.autosave_error = ""
 
 
 # =========================================================
@@ -518,15 +489,28 @@ def collect_answers():
     return answers, axis_errors, new_options, axis_status
 
 
+def autosave_callback():
+    """ينفّذ قبل إعادة رسم Streamlit عند تغيير إجابة أو قسم."""
+    if st.session_state.get("questionnaire_submitted", False):
+        return
+    try:
+        current_answers, _, _, current_status = collect_answers()
+        save_draft(current_answers, current_status)
+        st.session_state.autosave_error = ""
+    except Exception as exc:
+        st.session_state.autosave_error = str(exc)
+
+
 def apply_draft_to_session(payload):
     """تحميل إجابات المسودة إلى عناصر الواجهة قبل إعادة رسمها."""
     restored_answers = payload.get("answers", {}) or {}
     restored_status = payload.get("axis_status", {}) or {}
+    restored_by_id = payload.get("answers_by_id", {}) or {}
 
     for q in questions:
         qid = q["id"]
         answer_key = f"Q{qid}: {q['question']}"
-        old_val = str(restored_answers.get(answer_key, "") or "")
+        old_val = str(restored_by_id.get(str(qid)) or restored_answers.get(answer_key, "") or "")
 
         if q["type"] == "single":
             custom_label = "➕ إضافة خيار آخر"
@@ -546,6 +530,8 @@ def apply_draft_to_session(payload):
             if q["allow_new"]:
                 custom = [v for v in values if v not in q["options"]]
                 st.session_state[f"custom_multi_{qid}"] = ", ".join(custom)
+        else:
+            st.session_state[f"q_{qid}"] = old_val
 
     for axis_name in axes:
         status = restored_status.get(
@@ -558,7 +544,6 @@ def apply_draft_to_session(payload):
     if restored_id:
         st.session_state.submission_id = restored_id
 
-    st.session_state.axis_pages = {ax: 0 for ax in axes}
     st.session_state.active_axis = axes[0] if axes else ""
     if axes:
         st.session_state["axis_selector"] = axes[0]
@@ -567,75 +552,62 @@ def apply_draft_to_session(payload):
 
 
 def save_draft(answers, axis_status):
-    """حفظ نسخة عمل واحدة لكل جهة في ورقة Drafts."""
+    """تحديث صف واحد ثابت لكل جهة، مع مفاتيح أسئلة ثابتة حسب ID."""
+    answers_by_id = {}
+    for q in questions:
+        key = f"Q{q['id']}: {q['question']}"
+        answers_by_id[str(q['id'])] = answers.get(key, "")
+
     payload = {
+        "schema_version": 2,
         "submission_id": st.session_state.submission_id,
         "answers": answers,
+        "answers_by_id": answers_by_id,
         "axis_status": axis_status,
     }
-    json_value = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    json_value = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    timestamp = now_uae()
 
     def write():
         records = drafts_ws.get_all_records()
-        matching_rows = [
-            (str(row.get("Updated At (UAE)", "")).strip(), idx)
-            for idx, row in enumerate(records, start=2)
-            if str(row.get("User Code", "")).strip() == str(
-                st.session_state.user_code
-            ).strip()
-        ]
-        target_row = max(matching_rows, default=("", None))[1]
+        matches = []
+        for idx, row in enumerate(records, start=2):
+            if str(row.get("User Code", "")).strip() == str(st.session_state.user_code).strip():
+                matches.append((str(row.get("Updated At (UAE)", "")), idx))
 
+        # في حال وجود تكرارات قديمة، نحدّث أحدث صف ولا ننشئ صفاً جديداً.
+        target_row = max(matches, key=lambda item: (item[0], item[1]))[1] if matches else None
         values = [[
             st.session_state.user_code,
             st.session_state.entity_name,
             st.session_state.submission_id,
-            now_uae(),
+            timestamp,
             json_value,
         ]]
-
         if target_row:
-            old_values = drafts_ws.row_values(target_row)
-            old_json = old_values[4] if len(old_values) >= 5 else ""
-            if old_json and old_json != json_value:
-                # لا نكرر النسخة نفسها؛ نحتفظ فقط بالتغييرات الفعلية.
-                draft_history_ws.append_row(
-                    old_values[:5],
-                    value_input_option="RAW",
-                    table_range="A1",
-                )
             drafts_ws.update(
                 range_name=f"A{target_row}:E{target_row}",
                 values=values,
                 value_input_option="RAW",
             )
         else:
-            drafts_ws.append_row(
-                values[0],
-                value_input_option="RAW",
-                table_range="A1",
-            )
+            drafts_ws.append_row(values[0], value_input_option="RAW", table_range="A1")
 
     sheets_write_with_retry(write)
-    st.session_state.draft_saved_at = now_uae()
+    st.session_state.draft_saved_at = timestamp
+    st.session_state.autosave_error = ""
 
 
 def delete_draft(user_code):
-    """حذف المسودة ونسخها الاحتياطية بعد اعتماد الإرسال النهائي."""
+    """حذف صفوف المسودة الخاصة بالجهة بعد نجاح الاعتماد النهائي فقط."""
     def delete():
-        for worksheet in (drafts_ws, draft_history_ws):
-            records = worksheet.get_all_records()
-            matching_rows = [
-                idx for idx, row in enumerate(records, start=2)
-                if str(row.get("User Code", "")).strip() == str(user_code).strip()
-            ]
-            for idx in reversed(matching_rows):
-                worksheet.delete_rows(idx)
-
+        records = drafts_ws.get_all_records()
+        matching_rows = [
+            idx for idx, row in enumerate(records, start=2)
+            if str(row.get("User Code", "")).strip() == str(user_code).strip()
+        ]
+        for idx in reversed(matching_rows):
+            drafts_ws.delete_rows(idx)
     sheets_write_with_retry(delete)
 
 
@@ -717,12 +689,12 @@ def save_or_update_response(answer_data, row_idx=None):
 
 
 # =========================================================
-# 7. واجهة الاستبيان والتنقل بين الأقسام والصفحات
+# 7. واجهة الاستبيان: محور واحد في صفحة واحدة
 # =========================================================
 st.title("📋 نموذج تقييم المخاطر")
 st.caption(f"الجهة: {st.session_state.entity_name}")
 
-# استرجاع يدوي آمن: معاينة أولاً ثم تأكيد قبل استبدال الإجابات الحالية.
+# استرجاع يدوي مع معاينة النسخة قبل استبدال البيانات الحالية.
 if not st.session_state.questionnaire_submitted:
     if st.button("↩️ البحث عن مسودة محفوظة", use_container_width=True):
         try:
@@ -744,29 +716,34 @@ if not st.session_state.questionnaire_submitted:
 
     pending_restore = st.session_state.get("pending_restore_draft")
     if pending_restore:
-        draft_answers = pending_restore["payload"].get("answers", {}) or {}
+        payload = pending_restore["payload"]
+        draft_answers = payload.get("answers", {}) or {}
+        draft_by_id = payload.get("answers_by_id", {}) or {}
         answered_count = sum(
             1 for q in questions
-            if str(draft_answers.get(f"Q{q['id']}: {q['question']}", "")).strip()
+            if str(
+                draft_by_id.get(str(q["id"]))
+                or draft_answers.get(f"Q{q['id']}: {q['question']}", "")
+            ).strip()
         )
         st.info(
-            f"عُثر على نسخة محفوظة بتاريخ **{pending_restore['updated_at'] or 'تاريخ غير متاح'}** "
-            f"وتحتوي على إجابات لـ **{answered_count}** سؤالاً. "
-            "لن يتم استبدال إجابات الشاشة الحالية إلا بعد تأكيدك."
+            f"عُثر على مسودة محفوظة بتاريخ **{pending_restore['updated_at'] or 'غير متاح'}** "
+            f"وتحتوي على إجابات لـ **{answered_count} من {len(questions)}** سؤالاً. "
+            "لن تتغير الإجابات الحالية إلا بعد التأكيد."
         )
-        confirm_col, cancel_col = st.columns(2)
-        with confirm_col:
-            if st.button("استرجاع هذه المسودة", type="primary", use_container_width=True):
-                apply_draft_to_session(pending_restore["payload"])
+        col_confirm, col_cancel = st.columns(2)
+        with col_confirm:
+            if st.button("استرجاع المسودة", type="primary", use_container_width=True):
+                apply_draft_to_session(payload)
                 st.session_state.pending_restore_draft = None
                 st.rerun()
-        with cancel_col:
+        with col_cancel:
             if st.button("إلغاء", use_container_width=True):
                 st.session_state.pending_restore_draft = None
                 st.rerun()
 
 if st.session_state.pop("restore_message", False):
-    st.success("تم استرجاع المسودة بنجاح. يمكنك متابعة الإجابة من حيث توقفت.")
+    st.success("تم استرجاع المسودة. يمكنك متابعة الإجابة.")
 
 if existing_response and not st.session_state.allow_edit:
     st.warning("⚠️ إجابات جهتك مقفلة من الإعدادات ولا يمكن تعديلها.")
@@ -777,232 +754,133 @@ if not axes:
     st.warning("لا توجد أقسام أو أسئلة معرفة في ورقة Questions.")
     st.stop()
 
-QUESTIONS_PER_PAGE = 5
-
-# اختيار قسم واحد بدلاً من st.tabs:
-# Streamlit لا يوفر حدثاً مباشراً عند الضغط على تبويب st.tabs،
-# أما selectbox فيسمح بالتقاط تغيير القسم وحفظ المسودة أثناء إعادة التشغيل.
+# اختيار القسم. عند التبديل يحفظ Streamlit القسم السابق قبل إعادة الرسم.
 selected_axis = st.selectbox(
     "اختر القسم:",
     options=axes,
     index=axes.index(st.session_state.active_axis)
     if st.session_state.active_axis in axes else 0,
     key="axis_selector",
+    on_change=autosave_callback,
 )
-
 st.session_state.active_axis = selected_axis
 
-# جمع جميع الإجابات من Session State قبل عرض القسم الحالي.
 answers, axis_errors, new_options, axis_status = collect_answers()
 
-# حفظ المسودة تلقائياً عند كل إعادة تشغيل للتطبيق بعد أي تفاعل.
-# يشمل ذلك تغيير الإجابة، التنقل بين الصفحات، وتغيير القسم.
-# يتم تخزين المسودة في صف واحد لكل جهة داخل ورقة Drafts.
-try:
-    if (
-        not st.session_state.questionnaire_submitted
-        and not st.session_state.get("pending_restore_draft")
-    ):
-        save_draft(answers, axis_status)
-except Exception as draft_error:
-    st.warning(
-        "تعذر حفظ المسودة تلقائياً حالياً. "
-        f"يرجى استخدام زر حفظ المسودة. التفاصيل: {draft_error}"
+if st.session_state.get("autosave_error"):
+    st.error(
+        "تعذر حفظ آخر تعديل في Google Sheets. لا تغلق الصفحة قبل إعادة المحاولة. "
+        + st.session_state.autosave_error
     )
+elif st.session_state.get("draft_saved_at"):
+    st.caption(f"💾 آخر حفظ مؤكد: {st.session_state.draft_saved_at} (توقيت الإمارات)")
 
-# شريط التقدم
+# مؤشر اكتمال الأقسام
 completed_axes = 0
 for ax in axes:
-    if not axis_status.get(ax):
-        continue
-    ax_qs = [q for q in questions if q["axis"] == ax]
-    if not axis_status[ax] == "لا ينطبق":
-        complete = True
-        for q in ax_qs:
-            val = answers.get(f"Q{q['id']}: {q['question']}", "")
-            if not val:
-                complete = False
-                break
-        if complete:
-            completed_axes += 1
-    else:
+    if axis_status.get(ax) == "لا ينطبق":
         completed_axes += 1
-
+    else:
+        ax_questions_for_status = [q for q in questions if q["axis"] == ax]
+        if all(
+            answers.get(f"Q{q['id']}: {q['question']}")
+            for q in ax_questions_for_status
+        ):
+            completed_axes += 1
 st.progress(
-    completed_axes / len(axes) if axes else 0,
+    completed_axes / len(axes),
     text=f"الأقسام المكتملة: {completed_axes}/{len(axes)}",
 )
 
-# قائمة توضح حالة كل قسم.
 status_labels = []
 for ax in axes:
     if axis_status.get(ax) == "لا ينطبق":
         status_labels.append(f"🚫 {ax}")
     else:
-        ax_qs = [q for q in questions if q["axis"] == ax]
+        ax_questions_for_status = [q for q in questions if q["axis"] == ax]
         is_complete = all(
-            answers.get(f"Q{q['id']}: {q['question']}", "")
-            for q in ax_qs
+            answers.get(f"Q{q['id']}: {q['question']}")
+            for q in ax_questions_for_status
         )
-        status_labels.append(
-            f"{'✅' if is_complete else '⏳'} {ax}"
-        )
-
+        status_labels.append(f"{'✅' if is_complete else '⏳'} {ax}")
 st.caption("حالة الأقسام: " + "  |  ".join(status_labels))
 st.divider()
 
 axis_questions = [q for q in questions if q["axis"] == selected_axis]
-current_page = st.session_state.axis_pages.get(selected_axis, 0)
-total_questions = len(axis_questions)
-total_pages = max(
-    1,
-    (total_questions + QUESTIONS_PER_PAGE - 1) // QUESTIONS_PER_PAGE,
-)
-current_page = min(current_page, total_pages - 1)
-st.session_state.axis_pages[selected_axis] = current_page
-
 st.subheader(selected_axis)
-
 st.toggle(
     "ينطبق هذا القسم على جهتي",
     key=f"axis_toggle_{selected_axis}",
+    on_change=autosave_callback,
     disabled=st.session_state.questionnaire_submitted,
 )
-
-applicable = st.session_state.get(
-    f"axis_toggle_{selected_axis}", True
-)
+applicable = st.session_state.get(f"axis_toggle_{selected_axis}", True)
 
 if not applicable:
-    st.info("تم استبعاد هذا القسم من التقييم، وسيتم حفظ إجاباته كـ «لا ينطبق».")
+    st.info("تم استبعاد هذا القسم من التقييم، وستُسجل إجاباته «لا ينطبق».")
 else:
-    start_idx = current_page * QUESTIONS_PER_PAGE
-    end_idx = min(start_idx + QUESTIONS_PER_PAGE, total_questions)
-    page_questions = axis_questions[start_idx:end_idx]
-
-    st.caption(f"الصفحة ({current_page + 1} من {total_pages})")
-
-    for q in page_questions:
+    # جميع أسئلة المحور تظهر هنا في صفحة واحدة قابلة للتمرير.
+    for q in axis_questions:
         qid = q["id"]
+        widget_key = f"q_{qid}"
         st.markdown(f"**{qid}. {q['question']}**")
 
         if q["type"] == "single":
             custom_label = "➕ إضافة خيار آخر"
-            display_options = ["— اختر —"] + q["options"]
+            options = ["— اختر —"] + q["options"]
             if q["allow_new"]:
-                display_options.append(custom_label)
-
-            # حماية القيمة القديمة إذا تغيرت خيارات السؤال في Google Sheets.
-            widget_key = f"q_{qid}"
-            if st.session_state.get(widget_key) not in display_options:
+                options.append(custom_label)
+            if st.session_state.get(widget_key) not in options:
                 st.session_state[widget_key] = "— اختر —"
-
             st.radio(
-                "اختر:",
-                options=display_options,
-                key=widget_key,
-                horizontal=True,
-                label_visibility="collapsed",
+                "اختر:", options=options, key=widget_key,
+                horizontal=True, label_visibility="collapsed",
+                on_change=autosave_callback,
                 disabled=st.session_state.questionnaire_submitted,
             )
-
-            if (
-                st.session_state.get(widget_key) == custom_label
-                and q["allow_new"]
-            ):
+            if st.session_state.get(widget_key) == custom_label and q["allow_new"]:
                 st.text_input(
-                    "اكتب الخيار:",
-                    key=f"custom_single_{qid}",
-                    label_visibility="collapsed",
+                    "اكتب الخيار:", key=f"custom_single_{qid}",
+                    label_visibility="collapsed", on_change=autosave_callback,
                     disabled=st.session_state.questionnaire_submitted,
                 )
 
         elif q["type"] == "multiple":
-            valid_selected = st.session_state.get(f"q_{qid}", [])
-            st.session_state[f"q_{qid}"] = [
-                value for value in valid_selected if value in q["options"]
-            ]
-
+            current_values = st.session_state.get(widget_key, [])
+            st.session_state[widget_key] = [v for v in current_values if v in q["options"]]
             st.multiselect(
-                "اختر:",
-                options=q["options"],
-                key=f"q_{qid}",
-                label_visibility="collapsed",
+                "اختر:", options=q["options"], key=widget_key,
+                label_visibility="collapsed", on_change=autosave_callback,
                 disabled=st.session_state.questionnaire_submitted,
             )
-
             if q["allow_new"]:
                 st.text_input(
                     "أضف خياراً آخر (افصل بين الخيارات بفاصلة):",
-                    key=f"custom_multi_{qid}",
-                    label_visibility="collapsed",
+                    key=f"custom_multi_{qid}", label_visibility="collapsed",
+                    on_change=autosave_callback,
                     disabled=st.session_state.questionnaire_submitted,
                 )
         else:
-            st.warning(
-                f"نوع السؤال ({q['type']}) غير مدعوم كعنصر إدخال حالياً."
+            st.text_area(
+                "الإجابة:", key=widget_key,
+                on_change=autosave_callback,
+                disabled=st.session_state.questionnaire_submitted,
             )
-
         st.markdown("---")
 
-
-# أزرار التنقل وحفظ القسم.
-col_prev, col_save, col_next = st.columns(3)
-
-with col_prev:
-    if st.button(
-        "⬅️ السابق",
-        use_container_width=True,
-        disabled=(current_page == 0 or st.session_state.questionnaire_submitted),
-    ):
-        # حفظ فوري قبل الانتقال.
-        current_answers, _, _, current_status = collect_answers()
-        save_draft(current_answers, current_status)
-        st.session_state.axis_pages[selected_axis] = max(0, current_page - 1)
-        st.rerun()
-
-with col_save:
-    if st.button(
-        "💾 حفظ القسم",
-        use_container_width=True,
-        disabled=st.session_state.questionnaire_submitted,
-    ):
-        current_answers, _, _, current_status = collect_answers()
-        save_draft(current_answers, current_status)
-        st.success("تم حفظ المسودة في قاعدة البيانات.")
-        st.rerun()
-
-with col_next:
-    if st.button(
-        "التالي ➡️",
-        use_container_width=True,
-        disabled=(
-            current_page >= total_pages - 1
-            or st.session_state.questionnaire_submitted
-        ),
-    ):
-        current_answers, _, _, current_status = collect_answers()
-        save_draft(current_answers, current_status)
-        st.session_state.axis_pages[selected_axis] = min(
-            total_pages - 1,
-            current_page + 1,
-        )
-        st.rerun()
-
-
-# حفظ المسودة يدوياً في أي وقت.
+# حفظ يدوي احتياطي بالإضافة إلى الحفظ التلقائي عند تغيير كل إجابة.
 if not st.session_state.questionnaire_submitted:
-    if st.button("💾 حفظ جميع الإجابات كمسودة", use_container_width=True):
-        current_answers, _, _, current_status = collect_answers()
+    if st.button("💾 حفظ القسم الحالي الآن", use_container_width=True):
         try:
+            current_answers, _, _, current_status = collect_answers()
             save_draft(current_answers, current_status)
-            st.success("تم حفظ جميع الإجابات كمسودة. يمكنك العودة لاحقاً.")
+            st.success("تم حفظ القسم في Google Sheets بنجاح.")
         except Exception as exc:
-            st.error(f"تعذر حفظ المسودة: {exc}")
-
+            st.error(f"تعذر حفظ القسم: {exc}")
 
 # =========================================================
 # 8. الاعتماد والإرسال النهائي
+# =========================================================
 # =========================================================
 st.divider()
 st.subheader("الاعتماد النهائي")
