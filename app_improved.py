@@ -49,9 +49,10 @@ st.markdown(
 # =========================================================
 QUESTIONS_TAB = "Questions"
 RESPONSES_TAB = "Responses"
+USERS_TAB = "Users"
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
 
-REQUIRED_COLUMNS = [
+REQUIRED_QUESTIONS_COLUMNS = [
     "ID",
     "Axis",
     "Question",
@@ -82,13 +83,74 @@ try:
     spreadsheet = get_spreadsheet()
     questions_ws = spreadsheet.worksheet(QUESTIONS_TAB)
     responses_ws = spreadsheet.worksheet(RESPONSES_TAB)
+    users_ws = spreadsheet.worksheet(USERS_TAB)
 except Exception as e:
-    st.error(f"خطأ في الاتصال بقاعدة البيانات (Google Sheets): {e}")
+    st.error(
+        f"خطأ في الاتصال بقاعدة البيانات أو التأكد من وجود الأوراق المطلوبة (Questions, Responses, Users): {e}"
+    )
     st.stop()
 
 
 # =========================================================
-# 3. Load and validate questionnaire configuration
+# 3. Authentication & Settings (Login via Users sheet)
+# =========================================================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "entity_name" not in st.session_state:
+    st.session_state.entity_name = ""
+if "user_code" not in st.session_state:
+    st.session_state.user_code = ""
+if "allow_edit" not in st.session_state:
+    st.session_state.allow_edit = True
+
+
+@st.cache_data(ttl=30)
+def load_users():
+    """Load authorized entities, codes, and edit permissions from Users tab."""
+    records = users_ws.get_all_records()
+    users_dict = {}
+    for r in records:
+        code = str(r.get("Code", "")).strip()
+        entity = str(r.get("Entity_Name", "")).strip()
+        status = str(r.get("Status", "active")).strip().lower()
+        allow_edit_val = str(r.get("Allow_Edit", "yes")).strip().lower() in {"yes", "y", "true", "1", "نعم"}
+        
+        if code and entity and status == "active":
+            users_dict[code] = {
+                "entity": entity,
+                "allow_edit": allow_edit_val
+            }
+    return users_dict
+
+
+if not st.session_state.authenticated:
+    st.title("🔐 تسجيل الدخول لنموذج تقييم المخاطر")
+    st.write("يرجى إدخال رمز الدخول (الكود السري) الخاص بجهتك للمتابعة.")
+
+    with st.form("login_form"):
+        entered_code = st.text_input("رمز الدخول:", type="password")
+        submit_login = st.form_submit_button("دخول", use_container_width=True)
+
+        if submit_login:
+            try:
+                valid_users = load_users()
+                cleaned_code = entered_code.strip()
+                if cleaned_code in valid_users:
+                    st.session_state.authenticated = True
+                    st.session_state.entity_name = valid_users[cleaned_code]["entity"]
+                    st.session_state.user_code = cleaned_code
+                    st.session_state.allow_edit = valid_users[cleaned_code]["allow_edit"]
+                    st.rerun()
+                else:
+                    st.error("رمز الدخول غير صحيح أو غير مفعل. يرجى المراجعة.")
+            except Exception as auth_err:
+                st.error(f"حدث خطأ أثناء التحقق من الرمز: {auth_err}")
+
+    st.stop()
+
+
+# =========================================================
+# 4. Load questionnaire & Existing User Response (if any)
 # =========================================================
 def parse_yes_no(value):
     return str(value).strip().lower() in {"yes", "y", "true", "1", "نعم"}
@@ -111,7 +173,11 @@ def load_questions():
         raise ValueError("ورقة Questions لا تحتوي على أسئلة.")
 
     headers = questions_ws.row_values(1)
-    missing = [column for column in REQUIRED_COLUMNS if column not in headers]
+    missing = [
+        column
+        for column in REQUIRED_QUESTIONS_COLUMNS
+        if column not in headers
+    ]
     if missing:
         raise ValueError(
             "أعمدة غير موجودة في ورقة Questions: " + ", ".join(missing)
@@ -177,8 +243,30 @@ except Exception as error:
 axes = list(dict.fromkeys(q["axis"] for q in questions))
 
 
+@st.cache_data(ttl=10)
+def get_existing_response(user_code):
+    """Check if the entity has already submitted a response and return it along with its row index."""
+    try:
+        data = responses_ws.get_all_records()
+        headers = responses_ws.row_values(1)
+        user_code_col = "User Code" if "User Code" in headers else None
+        
+        if not user_code_col:
+            return None, None
+
+        for idx, row in enumerate(data, start=2): # Start from row 2
+            if str(row.get(user_code_col, "")).strip() == str(user_code).strip():
+                return row, idx
+    except Exception:
+        pass
+    return None, None
+
+
+existing_response, existing_row_idx = get_existing_response(st.session_state.user_code)
+
+
 # =========================================================
-# 4. Helpers for saving responses and new options
+# 5. Helpers for saving / updating responses and options
 # =========================================================
 def update_new_options(new_options):
     if not new_options:
@@ -213,7 +301,8 @@ def update_new_options(new_options):
         questions_ws.batch_update(updates, value_input_option="RAW")
 
 
-def save_response(answer_data):
+def save_or_update_response(answer_data, row_idx=None):
+    """Save new response or update existing row if already submitted."""
     existing_headers = responses_ws.row_values(1)
 
     headers = list(existing_headers)
@@ -224,37 +313,72 @@ def save_response(answer_data):
     if not headers:
         headers = list(answer_data.keys())
 
+    # Ensure headers row is up to date
     responses_ws.update(
         range_name="A1",
         values=[headers],
         value_input_option="RAW",
     )
 
-    row = [answer_data.get(header, "") for header in headers]
-    responses_ws.append_row(
-        row,
-        value_input_option="USER_ENTERED",
-        table_range="A1",
-    )
+    row_values = [answer_data.get(header, "") for header in headers]
+
+    if row_idx:
+        # Update existing row
+        cell_range = f"A{row_idx}:" + rowcol_to_a1(row_idx, len(headers))
+        responses_ws.update(
+            range_name=cell_range,
+            values=[row_values],
+            value_input_option="USER_ENTERED",
+        )
+    else:
+        # Append new row
+        responses_ws.append_row(
+            row_values,
+            value_input_option="USER_ENTERED",
+            table_range="A1",
+        )
 
 
 # =========================================================
-# 5. Questionnaire interface (Tabs per Axis)
+# 6. Questionnaire interface
 # =========================================================
-st.title("📋 نموذج تقييم المخاطر")
+col_title, col_logout = st.columns([4, 1])
+with col_title:
+    st.title("📋 نموذج تقييم المخاطر")
+with col_logout:
+    st.write("")
+    if st.button("تسجيل الخروج"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+st.info(f"مرحباً بك: **{st.session_state.entity_name}**")
+
+# إذا كان هناك رد سابق والتعديل مغلق حسب الإعدادات
+if existing_response and not st.session_state.allow_edit:
+    st.warning("⚠️ لقد قمت بتقديم إجاباتك مسبقاً، وحالة الحساب الحالية **غير مسموح لها بالتعديل** (مقفل من الإعدادات). يمكنك مراجعة إجاباتك أدناه:")
+    st.json(existing_response)
+    st.stop()
+
+elif existing_response and st.session_state.allow_edit:
+    st.success("📝 لديك إجابات سابقة مسجلة. يمكنك مراجعتها، تعديل ما ترغب، ثم حفظ التحديثات.")
+
 st.write(
-    "يرجى مراجعة الأسئلة والإجابة عنها في كل تبويب. "
-    "يمكنك حفظ وتأكيد كل محور على حدة، ثم الاعتماد النهائي بالأسفل."
+    "يرجى الإجابة عن الأسئلة في كل محور. "
+    "تم تقسيم الأسئلة لتسهيل التصفح وتقليل التمرير الطولي."
 )
 
 if "questionnaire_submitted" not in st.session_state:
     st.session_state.questionnaire_submitted = False
 
 if "submission_id" not in st.session_state:
-    st.session_state.submission_id = str(uuid.uuid4())
+    st.session_state.submission_id = existing_response.get("Submission ID", str(uuid.uuid4())) if existing_response else str(uuid.uuid4())
 
 if "saved_axes" not in st.session_state:
-    st.session_state.saved_axes = set()
+    st.session_state.saved_axes = set(axes) if existing_response else set()
+
+if "axis_pages" not in st.session_state:
+    st.session_state.axis_pages = {ax: 0 for ax in axes}
 
 answers = {}
 axis_errors = {}
@@ -266,6 +390,7 @@ for axis_name in axes:
     tab_labels.append(f"{status_icon} {axis_name}")
 
 tabs = st.tabs(tab_labels)
+QUESTIONS_PER_PAGE = 4
 
 for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
     axis_questions = [q for q in questions if q["axis"] == axis_name]
@@ -275,16 +400,20 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
         with st.container(border=True):
             st.header(f"📌 {axis_name}")
 
+            # استرجاع حالة المحور القديمة إن وجدت
+            axis_status_key = f"[حالة المحور] {axis_name}"
+            default_axis_val = True
+            if existing_response and existing_response.get(axis_status_key) == "لا ينطبق":
+                default_axis_val = False
+
             applicable = st.toggle(
                 "هذا المحور ينطبق على جهتي",
-                value=True,
+                value=default_axis_val,
                 key=f"axis_{axis_index}",
                 disabled=st.session_state.questionnaire_submitted,
             )
 
-            answers[f"[حالة المحور] {axis_name}"] = (
-                "ينطبق" if applicable else "لا ينطبق"
-            )
+            answers[axis_status_key] = "ينطبق" if applicable else "لا ينطبق"
 
             if not applicable:
                 st.caption("تم استبعاد هذا المحور؛ ستُسجل جميع أسئلته كـ «لا ينطبق».")
@@ -292,10 +421,24 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                     answers[f"Q{q['id']}: {q['question']}"] = "لا ينطبق"
             else:
                 st.divider()
-                for q in axis_questions:
+                
+                total_q = len(axis_questions)
+                total_pages = (total_q + QUESTIONS_PER_PAGE - 1) // QUESTIONS_PER_PAGE
+                current_page = st.session_state.axis_pages.get(axis_name, 0)
+                
+                start_idx = current_page * QUESTIONS_PER_PAGE
+                end_idx = min(start_idx + QUESTIONS_PER_PAGE, total_q)
+                page_questions = axis_questions[start_idx:end_idx]
+
+                st.caption(f"الصفحة ({current_page + 1} من {total_pages}) لهذا المحور")
+
+                for q in page_questions:
                     qid = q["id"]
                     answer_key = f"Q{qid}: {q['question']}"
                     st.subheader(f"{qid}. {q['question']}")
+
+                    # استرجاع الإجابة القديمة إن وجدت
+                    old_val = existing_response.get(answer_key, "") if existing_response else ""
 
                     if q["type"] == "single":
                         custom_label = "➕ إضافة خيار جديد..."
@@ -303,10 +446,18 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                         if q["allow_new"]:
                             display_options.append(custom_label)
 
+                        # تحديد الإفتراضي بناءً على الإجابة القديمة
+                        default_index = 0
+                        if old_val in q["options"]:
+                            default_index = display_options.index(old_val)
+                        elif old_val and q["allow_new"]:
+                            display_options.insert(-1, old_val)
+                            default_index = display_options.index(old_val)
+
                         selected = st.radio(
                             "اختر إجابة واحدة:",
                             options=display_options,
-                            index=0,
+                            index=default_index,
                             key=f"q_{qid}",
                             disabled=st.session_state.questionnaire_submitted,
                         )
@@ -314,6 +465,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                         if selected == custom_label:
                             custom_value = st.text_input(
                                 "اكتب الخيار الجديد:",
+                                value=old_val if old_val not in q["options"] and old_val else "",
                                 key=f"custom_{qid}",
                                 disabled=st.session_state.questionnaire_submitted,
                             ).strip()
@@ -334,32 +486,36 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                             answers[answer_key] = selected
 
                     elif q["type"] == "multiple":
+                        default_multi = [v.strip() for v in old_val.split("|") if v.strip()] if old_val else []
+                        
                         selected_values = st.multiselect(
                             "يمكن اختيار أكثر من إجابة:",
                             options=q["options"],
+                            default=[v for v in default_multi if v in q["options"]],
                             placeholder="اختر إجابة أو أكثر...",
                             key=f"q_{qid}",
                             disabled=st.session_state.questionnaire_submitted,
                         )
 
                         custom_value = ""
+                        extra_defaults = [v for v in default_multi if v not in q["options"]]
                         if q["allow_new"]:
                             custom_value = st.text_input(
                                 "إضافة خيار غير موجود (اختياري):",
+                                value=", ".join(extra_defaults),
                                 key=f"custom_{qid}",
                                 disabled=st.session_state.questionnaire_submitted,
                             ).strip()
 
                         final_values = list(selected_values)
                         if custom_value:
-                            if custom_value.casefold() not in {
-                                v.casefold() for v in final_values
-                            }:
-                                final_values.append(custom_value)
-                            if custom_value.casefold() not in {
-                                v.casefold() for v in q["options"]
-                            }:
-                                new_options[qid] = custom_value
+                            for cv in custom_value.split(","):
+                                cv_clean = cv.strip()
+                                if cv_clean:
+                                    if cv_clean.casefold() not in {v.casefold() for v in final_values}:
+                                        final_values.append(cv_clean)
+                                    if cv_clean.casefold() not in {v.casefold() for v in q["options"]}:
+                                        new_options[qid] = cv_clean
 
                         answers[answer_key] = " | ".join(final_values)
                         if not final_values:
@@ -367,28 +523,35 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                                 f"يرجى اختيار إجابة واحدة على الأقل للسؤال رقم {qid}."
                             )
 
-                    st.write("")
+                    st.write("---")
 
-            # زر الحفظ المؤقت للمحور الحالي
+                col_prev, col_next = st.columns(2)
+                with col_prev:
+                    if current_page > 0:
+                        if st.button("⬅️ الأسئلة السابقة", key=f"prev_{axis_name}"):
+                            st.session_state.axis_pages[axis_name] -= 1
+                            st.rerun()
+                with col_next:
+                    if current_page < total_pages - 1:
+                        if st.button("الأسئلة التالية ➡️", key=f"next_{axis_name}"):
+                            st.session_state.axis_pages[axis_name] += 1
+                            st.rerun()
+
             if not st.session_state.questionnaire_submitted:
-                st.divider()
+                st.write("")
                 if st.button(
                     f"💾 حفظ وتأكيد محور ({axis_name})",
                     key=f"save_btn_{axis_index}",
                     use_container_width=True,
+                    type="secondary"
                 ):
-                    if axis_errors[axis_name]:
-                        st.error("يرجى استكمال النواقص في هذا المحور:")
-                        for err in axis_errors[axis_name]:
-                            st.write(f"- {err}")
-                    else:
-                        st.session_state.saved_axes.add(axis_name)
-                        st.success(f"تم تأكيد إجابات محور «{axis_name}» بنجاح.")
-                        st.rerun()
+                    st.session_state.saved_axes.add(axis_name)
+                    st.success(f"تم تأكيد إجابات محور «{axis_name}» بنجاح.")
+                    st.rerun()
 
 
 # =========================================================
-# 6. Final Submit and Confirmation
+# 7. Final Submit and Update
 # =========================================================
 st.divider()
 st.subheader("📤 الاعتماد النهائي للاستبيان")
@@ -404,8 +567,10 @@ all_validation_errors = [
 ]
 
 if not st.session_state.questionnaire_submitted:
+    button_label = "✅ تحديث الإجابات في قاعدة البيانات" if existing_response else "✅ إرسال جميع الإجابات إلى قاعدة البيانات"
+    
     if st.button(
-        "✅ إرسال جميع الإجابات إلى قاعدة البيانات",
+        button_label,
         type="primary",
         use_container_width=True,
     ):
@@ -419,31 +584,25 @@ if not st.session_state.questionnaire_submitted:
                 timestamp = datetime.now(DUBAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
                 response_data = {
                     "Submission ID": st.session_state.submission_id,
+                    "Entity Name": st.session_state.entity_name,
+                    "User Code": st.session_state.user_code,
                     "Timestamp (UAE)": timestamp,
                 }
                 response_data.update(answers)
 
-                save_response(response_data)
+                # حفظ جديد أو تحديث الصف الحالي بناءً على وجود رد سابق
+                save_or_update_response(response_data, row_idx=existing_row_idx)
                 update_new_options(new_options)
 
                 st.cache_data.clear()
                 st.session_state.questionnaire_submitted = True
-                st.success("تم إرسال الاستبيان بالكامل بنجاح!")
+                st.success("تم اعتماد وإرسال الإجابات بنجاح!")
                 st.rerun()
             except Exception as error:
                 st.error(f"تعذر حفظ الإجابات: {error}")
 else:
-    st.success("تم استلام إجاباتك. شكراً لمشاركتك.")
-    if st.button("بدء استجابة جديدة", use_container_width=True):
-        keys_to_clear = [
-            key
-            for key in st.session_state.keys()
-            if key.startswith(("axis_", "q_", "custom_"))
-        ]
-        for key in keys_to_clear:
+    st.success("تم استلام إجاباتك وحفظها بنجاح. شكراً لمشاركتك.")
+    if st.button("تسجيل الخروج", use_container_width=True):
+        for key in list(st.session_state.keys()):
             del st.session_state[key]
-
-        st.session_state.saved_axes = set()
-        st.session_state.submission_id = str(uuid.uuid4())
-        st.session_state.questionnaire_submitted = False
         st.rerun()
