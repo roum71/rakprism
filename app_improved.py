@@ -99,7 +99,7 @@ except Exception as e:
 
 
 # =========================================================
-# 3. Authentication & Settings
+# 3. Authentication & Settings (Cached to prevent 429 errors)
 # =========================================================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -111,7 +111,7 @@ if "allow_edit" not in st.session_state:
     st.session_state.allow_edit = True
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=300)
 def load_users():
     records = users_ws.get_all_records()
     users_dict = {}
@@ -160,13 +160,13 @@ def parse_options(value):
     return [opt.strip() for opt in str(value).split("|") if opt.strip()]
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def load_questions():
     records = questions_ws.get_all_records()
     headers = questions_ws.row_values(1)
     missing = [c for c in REQUIRED_QUESTIONS_COLUMNS if c not in headers]
     if missing:
-        raise ValueError(f"أعمدة مفقودة: {', '.join(missing)}")
+        raise ValueError(f"أعمدة مفقودة في الأسئلة: {', '.join(missing)}")
 
     questions = []
     seen_ids = set()
@@ -194,7 +194,7 @@ except Exception as error:
 axes = list(dict.fromkeys(q["axis"] for q in questions))
 
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=120)
 def get_existing_response(user_code):
     try:
         data = responses_ws.get_all_records()
@@ -314,7 +314,7 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-# --- محتوى الأقسام والأسئلة ---
+# --- محتوى الأقسام والأسئلة (تسميات الأقسام مباشرة بدون كلمة محور) ---
 tab_labels = [f"{'✅' if ax in st.session_state.saved_axes else '⏳'} {ax}" for ax in axes]
 tabs = st.tabs(tab_labels)
 QUESTIONS_PER_PAGE = 5
@@ -364,7 +364,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 
                     old_val = existing_response.get(answer_key, "") if existing_response else ""
 
-                    # نوع السؤال: اختيار مفرد (Single)
+                    # 1. نوع السؤال: اختيار مفرد (Single)
                     if q["type"] == "single":
                         custom_label = "➕ إضافة خيار آخر"
                         display_options = ["— اختر —"] + q["options"]
@@ -402,7 +402,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                         else:
                             answers[answer_key] = selected
 
-                    # نوع السؤال: اختيار متعدد (Multiple)
+                    # 2. نوع السؤال: اختيار متعدد (Multiple)
                     elif q["type"] == "multiple":
                         def_multi = [v.strip() for v in old_val.split("|") if v.strip()] if old_val else []
                         std_options = q["options"]
@@ -419,7 +419,6 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 
                         final_values = list(selected_values)
 
-                        # إذا كان مسموحاً بإضافة خيار جديد في الأسئلة المتعددة
                         if q["allow_new"]:
                             custom_input = st.text_input(
                                 "أضف خياراً آخر (إن وجد):",
