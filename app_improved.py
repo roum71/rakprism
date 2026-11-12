@@ -1,18 +1,250 @@
-# أضف هذا الجزء داخل <style> في القسم 1 لدعم اتجاه التبويبات من اليمين لليسار:
-"""
-div[data-baseweb="tab-list"] {
-    direction: rtl;
-    justify-content: flex-start;
-}
-"""
+import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import gspread
+import streamlit as st
+from google.oauth2.service_account import Credentials
+from gspread.utils import rowcol_to_a1
+
 
 # =========================================================
-# 5. Questionnaire interface (Tabs + Axis Progress)
+# 1. Page configuration
+# =========================================================
+st.set_page_config(
+    page_title="نموذج تقييم المخاطر",
+    page_icon="📋",
+    layout="centered",
+)
+
+st.markdown(
+    """
+    <style>
+    .main, [data-testid="stAppViewContainer"] {
+        direction: rtl;
+    }
+    label, p, h1, h2, h3, h4,
+    [data-testid="stMarkdownContainer"] {
+        text-align: right !important;
+        direction: rtl !important;
+    }
+    div[data-testid="stRadio"] > label,
+    div[data-testid="stMultiSelect"] > label,
+    div[data-testid="stTextInput"] > label {
+        direction: rtl;
+        text-align: right;
+    }
+    div[data-baseweb="tab-list"] {
+        direction: rtl;
+        justify-content: flex-start;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# 2. Configuration and Google Sheets connection
+# =========================================================
+QUESTIONS_TAB = "Questions"
+RESPONSES_TAB = "Responses"
+DUBAI_TZ = ZoneInfo("Asia/Dubai")
+
+REQUIRED_COLUMNS = [
+    "ID",
+    "Axis",
+    "Question",
+    "Type",
+    "Allow_New",
+    "Options",
+]
+
+
+@st.cache_resource
+def get_spreadsheet():
+    """Connect to the spreadsheet using the service-account secret."""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=scopes,
+    )
+    client = gspread.authorize(credentials)
+
+    spreadsheet_id = st.secrets["google_sheets"]["spreadsheet_id"]
+    return client.open_by_key(spreadsheet_id)
+
+
+try:
+    spreadsheet = get_spreadsheet()
+    questions_ws = spreadsheet.worksheet(QUESTIONS_TAB)
+    responses_ws = spreadsheet.worksheet(RESPONSES_TAB)
+except Exception as e:
+    st.error(f"خطأ في الاتصال بقاعدة البيانات (Google Sheets): {e}")
+    st.stop()
+
+
+# =========================================================
+# 3. Load and validate questionnaire configuration
+# =========================================================
+def parse_yes_no(value):
+    return str(value).strip().lower() in {"yes", "y", "true", "1", "نعم"}
+
+
+def parse_options(value):
+    if value is None:
+        return []
+    return [
+        option.strip()
+        for option in str(value).split("|")
+        if option.strip()
+    ]
+
+
+@st.cache_data(ttl=60)
+def load_questions():
+    records = questions_ws.get_all_records()
+    if not records:
+        raise ValueError("ورقة Questions لا تحتوي على أسئلة.")
+
+    headers = questions_ws.row_values(1)
+    missing = [column for column in REQUIRED_COLUMNS if column not in headers]
+    if missing:
+        raise ValueError(
+            "أعمدة غير موجودة في ورقة Questions: " + ", ".join(missing)
+        )
+
+    questions = []
+    seen_ids = set()
+
+    for sheet_row, record in enumerate(records, start=2):
+        try:
+            question_id = int(record["ID"])
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"رقم السؤال في الصف {sheet_row} يجب أن يكون رقماً صحيحاً."
+            )
+
+        if question_id in seen_ids:
+            raise ValueError(f"رقم السؤال {question_id} مكرر.")
+        seen_ids.add(question_id)
+
+        axis = str(record["Axis"]).strip()
+        question_text = str(record["Question"]).strip()
+        question_type = str(record["Type"]).strip().lower()
+        options = parse_options(record.get("Options", ""))
+
+        if not axis or not question_text:
+            raise ValueError(
+                f"يرجى استكمال المحور ونص السؤال في الصف {sheet_row}."
+            )
+
+        if question_type not in {"single", "multiple"}:
+            raise ValueError(
+                f"نوع السؤال في الصف {sheet_row} يجب أن يكون "
+                "'single' أو 'multiple'."
+            )
+
+        if not options:
+            raise ValueError(
+                f"لا توجد خيارات للسؤال رقم {question_id}."
+            )
+
+        questions.append(
+            {
+                "id": question_id,
+                "axis": axis,
+                "question": question_text,
+                "type": question_type,
+                "allow_new": parse_yes_no(record.get("Allow_New", "no")),
+                "options": options,
+                "sheet_row": sheet_row,
+            }
+        )
+
+    return questions
+
+
+try:
+    questions = load_questions()
+except Exception as error:
+    st.error(f"تعذر تحميل إعدادات الاستبيان: {error}")
+    st.stop()
+
+axes = list(dict.fromkeys(q["axis"] for q in questions))
+
+
+# =========================================================
+# 4. Helpers for saving responses and new options
+# =========================================================
+def update_new_options(new_options):
+    if not new_options:
+        return
+
+    sheet_headers = questions_ws.row_values(1)
+    options_col = sheet_headers.index("Options") + 1
+
+    all_records = questions_ws.get_all_records()
+    updates = []
+
+    for sheet_row, record in enumerate(all_records, start=2):
+        question_id = int(record["ID"])
+        if question_id not in new_options:
+            continue
+
+        old_options = parse_options(record.get("Options", ""))
+        new_option = new_options[question_id].strip()
+
+        existing_lower = {item.casefold() for item in old_options}
+        if new_option and new_option.casefold() not in existing_lower:
+            updated_options = old_options + [new_option]
+            cell = rowcol_to_a1(sheet_row, options_col)
+            updates.append(
+                {
+                    "range": cell,
+                    "values": [[" | ".join(updated_options)]],
+                }
+            )
+
+    if updates:
+        questions_ws.batch_update(updates, value_input_option="RAW")
+
+
+def save_response(answer_data):
+    existing_headers = responses_ws.row_values(1)
+
+    headers = list(existing_headers)
+    for key in answer_data:
+        if key not in headers:
+            headers.append(key)
+
+    if not headers:
+        headers = list(answer_data.keys())
+
+    responses_ws.update(
+        range_name="A1",
+        values=[headers],
+        value_input_option="RAW",
+    )
+
+    row = [answer_data.get(header, "") for header in headers]
+    responses_ws.append_row(
+        row,
+        value_input_option="USER_ENTERED",
+        table_range="A1",
+    )
+
+
+# =========================================================
+# 5. Questionnaire interface (Tabs per Axis)
 # =========================================================
 st.title("📋 نموذج تقييم المخاطر")
 st.write(
     "يرجى مراجعة الأسئلة والإجابة عنها في كل تبويب. "
-    "يمكنك حفظ كل محور على حدة ثم اعتماد الإرسال النهائي."
+    "يمكنك حفظ وتأكيد كل محور على حدة، ثم الاعتماد النهائي بالأسفل."
 )
 
 if "questionnaire_submitted" not in st.session_state:
@@ -25,12 +257,11 @@ if "saved_axes" not in st.session_state:
     st.session_state.saved_axes = set()
 
 answers = {}
-axis_errors = {}  # تخزين أخطاء كل محور على حدة
+axis_errors = {}
 new_options = {}
 
-# تجهيز أسماء التبويبات مع مؤشر حالة الإنجاز
 tab_labels = []
-for idx, axis_name in enumerate(axes):
+for axis_name in axes:
     status_icon = "✅" if axis_name in st.session_state.saved_axes else "⏳"
     tab_labels.append(f"{status_icon} {axis_name}")
 
@@ -138,7 +369,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 
                     st.write("")
 
-            # زر حفظ / التحقق من المحور الحالي
+            # زر الحفظ المؤقت للمحور الحالي
             if not st.session_state.questionnaire_submitted:
                 st.divider()
                 if st.button(
@@ -152,7 +383,7 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
                             st.write(f"- {err}")
                     else:
                         st.session_state.saved_axes.add(axis_name)
-                        st.success(f"تم تأكيد وحفظ إجابات محور «{axis_name}» مؤقتاً. انتقل للتبويب التالي.")
+                        st.success(f"تم تأكيد إجابات محور «{axis_name}» بنجاح.")
                         st.rerun()
 
 
@@ -162,7 +393,6 @@ for axis_index, (tab, axis_name) in enumerate(zip(tabs, axes)):
 st.divider()
 st.subheader("📤 الاعتماد النهائي للاستبيان")
 
-# شريط تقدم يوضح عدد المحاور المكتملة
 completed_count = len(st.session_state.saved_axes)
 st.progress(
     completed_count / len(axes) if axes else 0,
@@ -180,7 +410,7 @@ if not st.session_state.questionnaire_submitted:
         use_container_width=True,
     ):
         if all_validation_errors:
-            st.error("لا يمكن الإرسال لوجود أسئلة غير مكتملة في المحاور التالية:")
+            st.error("لا يمكن الإرسال لوجود أسئلة غير مكتملة في المحاور:")
             for ax_name, errs in axis_errors.items():
                 if errs:
                     st.write(f"**📌 {ax_name}:** ({len(errs)} أسئلة متبقية)")
